@@ -48,133 +48,168 @@ class ProxionUnifiedFS(LoggingMixIn, Operations):
         self.locks = {} # In-memory lock state for this mount
         self.etags = {} # Path -> ETag for optimistic concurrency
         
+        # Check for Local Direct Mode
+        self.local_mode = os.path.exists(self.pod_base) and os.path.isdir(self.pod_base)
+        mode_str = "DIRECT IO (LOCAL)" if self.local_mode else f"REMOTE PROXY ({proxy_url})"
         print(f"[Proxion] Unified FUSE Initialized. Backend: {pod_path}")
+        print(f"[Proxion] Mode: {mode_str}")
+
+    def _get_local_path(self, path):
+        # normalize path separators
+        rel = path.lstrip('/').replace('/', os.sep)
+        return os.path.join(self.pod_base, rel)
 
     def _get_pod_url(self, path):
-        full_path = f"{self.pod_base}/{path.lstrip('/')}"
-        return f"{self.proxy}/pod/{full_path.lstrip('/')}"
-
-    def _check_lock(self, path):
-        """Check for advisory locks (.proxion.lock) in the app silo."""
-        # Simple implementation: check if the parent directory has a lock file
-        parts = path.lstrip('/').split('/')
-        if len(parts) > 0:
-            app_silo = parts[0]
-            lock_path = f"/{app_silo}/.proxion.lock"
-            # We don't block here, but we could log warnings
-            pass
+        # Ensure path is normalized for HTTP (forward slashes) even on Windows
+        base = self.pod_base.replace('\\', '/')
+        rel_path = path.lstrip('/').lstrip('\\').replace('\\', '/')
+        full_path = f"{base}/{rel_path}"
+        return f"{self.proxy}/pod/{full_path}"
 
     def getattr(self, path, fh=None):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try:
+                st = os.stat(real_path)
+                # Force directory mode to be explicit for Windows
+                # We map real stat to FUSE dict
+                res = dict(st_mode=(st.st_mode | 0o777), st_nlink=st.st_nlink, st_size=st.st_size, st_ctime=st.st_ctime, st_mtime=st.st_mtime, st_atime=st.st_atime)
+                return res
+            except OSError:
+                raise OSError(errno.ENOENT, "No such file")
+
+        # ... Remote implementation ...
         cached = self.metadata_cache.get(path)
-        if cached:
-            return cached
-
-        url = self._get_pod_url(path)
+        if cached: return cached
         
-        # Root is always a directory
-        if path == '/':
-            res = dict(st_mode=(0o040000 | 0o755), st_nlink=2)
-            self.metadata_cache.set(path, res)
-            return res
+        # Root fallback
+        if path == '/': return dict(st_mode=(0o040000 | 0o777), st_nlink=2)
 
+        # Basic remote fetch (fallback)
+        url = self._get_pod_url(path)
         try:
-            # Fetch metadata from Proxy (which talks to Solid Pod)
             resp = requests.get(url, stream=True, timeout=3)
             if resp.status_code == 200:
                 header_type = resp.headers.get('Content-Type', '')
                 size = int(resp.headers.get('Content-Length', 0))
-                self.etags[path] = resp.headers.get('ETag')
-                
-                # If it's a LDP Container (Turtle), it's a directory
                 if 'text/turtle' in header_type or url.endswith('/'):
-                    res = dict(st_mode=(0o040000 | 0o755), st_nlink=2)
+                    res = dict(st_mode=(0o040000 | 0o777), st_nlink=2)
                 else:
-                    res = dict(st_mode=(0o100000 | 0o644), st_nlink=1, st_size=size)
-                
+                    res = dict(st_mode=(0o100000 | 0o666), st_nlink=1, st_size=size)
                 self.metadata_cache.set(path, res)
                 return res
-            else:
-                raise OSError(errno.ENOENT, "No such file")
-        except:
-             raise OSError(errno.ENOENT, "No such file")
+        except: pass
+        raise OSError(errno.ENOENT, "No such file")
 
     def readdir(self, path, fh):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try:
+                entries = ['.', '..'] + os.listdir(real_path)
+                return entries
+            except:
+                return ['.', '..']
+                
+        # ... Remote implementation ...
         url = self._get_pod_url(path)
-        resp = requests.get(url, headers={'Accept': 'text/turtle'}, timeout=5)
-        
-        if resp.status_code != 200:
-            return ['.', '..']
-
-        from rdflib import Graph, URIRef
-        from rdflib.namespace import Namespace
-        
-        g = Graph()
         try:
-            g.parse(data=resp.text, format="turtle")
-        except:
-            return ['.', '..']
-            
-        LDP = Namespace("http://www.w3.org/ns/ldp#")
-        files = ['.', '..']
-        for s, p, o in g.triples((None, LDP.contains, None)):
-            child_name = str(o).rstrip('/').split('/')[-1]
-            files.append(child_name)
-            
-        return files
+            resp = requests.get(url, headers={'Accept': 'text/turtle'}, timeout=5)
+            if resp.status_code == 200:
+                from rdflib import Graph
+                from rdflib.namespace import Namespace
+                g = Graph(); g.parse(data=resp.text, format="turtle")
+                LDP = Namespace("http://www.w3.org/ns/ldp#")
+                files = ['.', '..']
+                for s, p, o in g.triples((None, LDP.contains, None)):
+                    files.append(str(o).rstrip('/').split('/')[-1])
+                return files
+        except: pass
+        return ['.', '..']
 
     def read(self, path, size, offset, fh):
-        cache_key = f"{path}:{offset}:{size}"
-        cached_data = self.block_cache.get(cache_key)
-        if cached_data:
-            return cached_data
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try:
+                with open(real_path, 'rb') as f:
+                    f.seek(offset)
+                    return f.read(size)
+            except: return b''
 
+        # ... Remote implementation ...
         url = self._get_pod_url(path)
         headers = {'Range': f'bytes={offset}-{offset+size-1}'}
-        
         try:
             resp = requests.get(url, headers=headers, timeout=5)
-            if resp.status_code in [200, 206]:
-                data = resp.content
-                self.block_cache.set(cache_key, data)
-                return data
-        except Exception as e:
-            print(f"[Proxion] Read Error: {e}")
-            
+            if resp.status_code in [200, 206]: return resp.content
+        except: pass
         return b''
 
     def write(self, path, data, offset, fh):
-        """Optimistic write with ETag verification."""
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try:
+                # 'r+b' allows writing without truncating
+                mode = 'r+b' if os.path.exists(real_path) else 'wb'
+                with open(real_path, mode) as f:
+                    f.seek(offset)
+                    f.write(data)
+                return len(data)
+            except Exception as e:
+                print(f"[Proxion] Local Write Error: {e}")
+                raise OSError(errno.EACCES, "Write failed")
+
+        # ... Remote implementation ...
         url = self._get_pod_url(path)
-        headers = {'Content-Type': 'application/octet-stream'}
-        
-        # If we have an ETag, use it for If-Match (Collision Defense)
-        if path in self.etags and self.etags[path]:
-            headers['If-Match'] = self.etags[path]
-            
-        # For simplicity in this shell, we assume the Proxy handles partial updates 
-        # or we just PUT the whole thing if it's a small file.
-        # Real implementation would use PATCH or range-aware PUT.
-        resp = requests.put(url, data=data, headers=headers, timeout=10)
-        
-        if resp.status_code in [200, 201, 204]:
-            self.metadata_cache.set(path, None) # Invalidate
-            self.block_cache.set(path, None) # Invalidate
-            return len(data)
-        elif resp.status_code == 412:
-            print(f"[Proxion] Collision Detected on {path}! ETag mismatch.")
-            raise OSError(errno.EACCES, "Collision detected")
-            
-        return 0
+        resp = requests.put(url, data=data, timeout=10)
+        return len(data) if resp.status_code in [200, 201, 204] else 0
 
     def create(self, path, mode, fi=None):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try:
+                open(real_path, 'wb').close()
+                return 0
+            except: raise OSError(errno.EACCES, "Create failed")
+        
         url = self._get_pod_url(path)
-        resp = requests.put(url, data=b'', headers={'Content-Type': 'application/octet-stream'})
+        requests.put(url, data=b'')
         return 0
 
     def unlink(self, path):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try: os.remove(real_path)
+            except: pass
+            return 0
+            
         url = self._get_pod_url(path)
         requests.delete(url)
-        self.metadata_cache.set(path, None)
+        return 0
+
+    def mkdir(self, path, mode):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try: 
+                os.makedirs(real_path, exist_ok=True)
+                return 0
+            except Exception as e:
+                print(f"[Proxion] Local Mkdir Error: {e}")
+                raise OSError(errno.EACCES, f"Mkdir failed: {e}")
+        
+        url = self._get_pod_url(path)
+        requests.put(url + "/")
+        return 0
+
+    def rmdir(self, path):
+        if self.local_mode:
+            real_path = self._get_local_path(path)
+            try: os.rmdir(real_path)
+            except: pass
+            return 0
+            
+        url = self._get_pod_url(path)
+        requests.delete(url)
+        return 0
 
 def main(mountpoint, pod_path):
     # Drive P: by default if not specified
