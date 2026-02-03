@@ -51,19 +51,24 @@ class ProxionUnifiedFS(LoggingMixIn, Operations):
         # Check for Local Direct Mode
         self.local_mode = os.path.exists(self.pod_base) and os.path.isdir(self.pod_base)
         mode_str = "DIRECT IO (LOCAL)" if self.local_mode else f"REMOTE PROXY ({proxy_url})"
-        print(f"[Proxion] Unified FUSE Initialized. Backend: {pod_path}")
-        print(f"[Proxion] Mode: {mode_str}")
+        logging.info(f"FUSE Initialized. Backend: {pod_path}")
+        logging.info(f"Mode: {mode_str}")
 
     def _get_local_path(self, path):
         # normalize path separators
         rel = path.lstrip('/').replace('/', os.sep)
-        return os.path.join(self.pod_base, rel)
+        full = os.path.normpath(os.path.join(self.pod_base, rel))
+        # Safety check: Prevent climbing above pod_base
+        if not full.startswith(os.path.normpath(self.pod_base)):
+            logging.error(f"Security: Blocked attempt to access {full} outside of {self.pod_base}")
+            return self.pod_base
+        return full
 
     def _get_pod_url(self, path):
         # Ensure path is normalized for HTTP (forward slashes) even on Windows
-        base = self.pod_base.replace('\\', '/')
+        base = self.pod_base.lstrip('/').replace('\\', '/')
         rel_path = path.lstrip('/').lstrip('\\').replace('\\', '/')
-        full_path = f"{base}/{rel_path}"
+        full_path = f"{base}/{rel_path}".strip('/')
         return f"{self.proxy}/pod/{full_path}"
 
     def getattr(self, path, fh=None):
@@ -155,7 +160,7 @@ class ProxionUnifiedFS(LoggingMixIn, Operations):
                     f.write(data)
                 return len(data)
             except Exception as e:
-                print(f"[Proxion] Local Write Error: {e}")
+                logging.error(f"Local Write Error at {path}: {e}")
                 raise OSError(errno.EACCES, "Write failed")
 
         # ... Remote implementation ...
@@ -193,7 +198,7 @@ class ProxionUnifiedFS(LoggingMixIn, Operations):
                 os.makedirs(real_path, exist_ok=True)
                 return 0
             except Exception as e:
-                print(f"[Proxion] Local Mkdir Error: {e}")
+                logging.error(f"Local Mkdir Error at {path}: {e}")
                 raise OSError(errno.EACCES, f"Mkdir failed: {e}")
         
         url = self._get_pod_url(path)
@@ -211,13 +216,24 @@ class ProxionUnifiedFS(LoggingMixIn, Operations):
         requests.delete(url)
         return 0
 
-def main(mountpoint, pod_path):
+def main(mountpoint, pod_path, verbose=False):
     # Drive P: by default if not specified
-    print(f"[Proxion] Mounting Proxion Suite to {mountpoint}...")
-    FUSE(ProxionUnifiedFS(pod_path), mountpoint, nothreads=False, foreground=True)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s'
+    )
+    logging.info(f"Mounting Proxion Suite to {mountpoint}...")
+    try:
+        FUSE(ProxionUnifiedFS(pod_path), mountpoint, nothreads=False, foreground=True)
+    except Exception as e:
+        logging.critical(f"FUSE Mount failed: {e}")
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python mount.py <mountpoint> <pod_path>")
-        sys.exit(1)
-    main(sys.argv[1], sys.argv[2])
+    import argparse
+    parser = argparse.ArgumentParser(description="Proxion Unified FUSE Driver")
+    parser.add_argument("mountpoint", help="Mount point (e.g. P: or /mnt/proxion)")
+    parser.add_argument("pod_path", help="Local path or remote URI to mount")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    
+    args = parser.parse_args()
+    main(args.mountpoint, args.pod_path, args.verbose)
