@@ -5,6 +5,9 @@ import logging
 import time
 import threading
 import requests
+import json
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
 from fuse import FUSE, Operations, LoggingMixIn
 from datetime import datetime
 
@@ -35,134 +38,169 @@ class SimpleLRU:
         self.cache[key] = (value, time.time() + self.ttl)
         self.order.append(key)
 
+class PodClient:
+    """PROTOCOL CLIENT: Handles all communication with the Pod Proxy."""
+    def __init__(self, proxy_url="http://localhost:8089"):
+        self.proxy_url = proxy_url.rstrip('/')
+        self.session_key = ed25519.Ed25519PrivateKey.generate()
+        self.token = None
+        self._login()
+
+    def _get_pub_key_hex(self):
+        return self.session_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        ).hex()
+
+    def _login(self):
+        """Exchange session public key for a capability token."""
+        url = f"{self.proxy_url}/auth/stash_login"
+        try:
+            resp = requests.post(url, json={"pubkey": self._get_pub_key_hex()}, timeout=5)
+            if resp.status_code == 200:
+                self.token = resp.json()
+                logging.info("PodClient: Successfully acquired session capability token.")
+            else:
+                logging.error(f"PodClient: Authentication failed ({resp.status_code}): {resp.text}")
+        except Exception as e:
+            logging.error(f"PodClient: Could not reach Proxy for login: {e}")
+
+    def _sign_request(self, method, path):
+        """Generate a simplified DPoP proof."""
+        # In a full spec, this would be a JWT. Here we just sign the method+path.
+        payload = f"{method}:{path}"
+        signature = self.session_key.sign(payload.encode())
+        return json.dumps({
+            "method": method,
+            "path": path,
+            "signature": signature.hex(),
+            "pubkey": self._get_pub_key_hex()
+        })
+
+    def request(self, method, path, **kwargs):
+        if not self.token:
+            self._login()
+            if not self.token: return None
+
+        url = f"{self.proxy_url}/pod{path}"
+        headers = kwargs.pop("headers", {}).copy()
+        headers["Authorization"] = f"Bearer {json.dumps(self.token)}"
+        headers["DPoP"] = self._sign_request(method, path)
+        
+        try:
+            resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
+            if resp.status_code >= 400:
+                logging.error(f"Proxy Error {resp.status_code} for {method} {path}: {resp.text}")
+                return None
+            return resp
+        except Exception as e:
+            logging.error(f"Network Error for {method} {path}: {e}")
+            return None
+
+    def get_attr(self, path):
+        resp = self.request("GET", path, headers={"Accept": "application/json"})
+        if resp: return resp.json()
+        return None
+
+    def list_dir(self, path):
+        """List directory entries using Solid LDP (Turtle)."""
+        resp = self.request("GET", path, headers={"Accept": "text/turtle, application/json"})
+        if not resp: return []
+        
+        if 'text/turtle' in resp.headers.get('Content-Type', ''):
+            return self._parse_turtle_contains(resp.text)
+        
+        # Fallback to JSON
+        try:
+            return resp.json().get("entries", [])
+        except:
+            return []
+
+    def _parse_turtle_contains(self, turtle_text):
+        """Robust parser for full ldp:contains triples."""
+        import re
+        # Match <> ldp:contains <URI> .  or just ldp:contains <URI>
+        uris = re.findall(r'ldp:contains\s+<([^>]+)>', turtle_text)
+        
+        entries = []
+        for uri in uris:
+            clean = uri.strip().rstrip('/')
+            if clean: # Ignore self <>
+                entries.append(clean)
+        return entries
+
+    def read(self, path, size, offset):
+        headers = {"Range": f"bytes={offset}-{offset+size-1}"}
+        resp = self.request("GET", path, headers=headers)
+        if resp: return resp.content
+        return b''
+
+    def write(self, path, data, offset):
+        # Simplified PUT. Real implementation might need range support.
+        files = {"content": data}
+        params = {"offset": offset}
+        resp = self.request("PUT", path, files=files, params=params)
+        return len(data) if resp else 0
+
 class ProxionUnifiedFS(LoggingMixIn, Operations):
     """
     Unified High-Performance FUSE implementation for the Proxion Suite.
     Integrates physical disks as virtual directories within the Solid Pod (Drive P:).
     """
-    def __init__(self, raw_sources):
-        # raw_sources is a list of "Name|Path" strings
-        self.mounts = {}
-        self.primary_source = None
-        
-        for s in raw_sources:
-            if '|' in s:
-                name, path = s.split('|', 1)
-                # Cleanup name for valid folder (no slashes, no spaces ideally)
-                # Cleanup name for valid folder (No colons, no slashes, no spaces)
-                safe_name = name.replace(' ', '_').replace('/', '').replace('\\', '').replace(':', '_')
-                self.mounts[safe_name] = os.path.abspath(path.rstrip('/\\'))
-                if not self.primary_source:
-                    self.primary_source = self.mounts[safe_name]
-        
-        logging.info(f"FUSE Virtual Mounts: {self.mounts}")
-
-    def _resolve(self, path):
-        """Routes a pod path to the correct physical disk."""
-        parts = path.lstrip('/\\').split('/')
-        if not parts or parts[0] == '':
-            return self.primary_source, True # It's the root
-            
-        virtual_dir = parts[0]
-        if virtual_dir in self.mounts:
-            # Route to the specific physical disk
-            rel_path = os.sep.join(parts[1:])
-            return os.path.join(self.mounts[virtual_dir], rel_path), False
-            
-        # Fallback to primary source (for legacy files in the pod root)
-        return os.path.join(self.primary_source, path.lstrip('/\\')), False
+    def __init__(self, proxy_url="http://localhost:8089"):
+        self.client = PodClient(proxy_url)
+        logging.info(f"FUSE Initialized with Pod Proxy at {proxy_url}")
 
     def getattr(self, path, fh=None):
-        real_path, is_root = self._resolve(path)
-        try:
-            if is_root and not os.path.exists(real_path):
-                # Return dummy dir stats for root so the mount doesn't fail
-                return dict(st_mode=(0o40777), st_nlink=2, st_size=4096, 
-                            st_ctime=time.time(), st_mtime=time.time(), st_atime=time.time())
-            
-            st = os.stat(real_path)
-            return dict(st_mode=(st.st_mode | 0o777), st_nlink=st.st_nlink, st_size=st.st_size, 
-                        st_ctime=st.st_ctime, st_mtime=st.st_mtime, st_atime=st.st_atime)
-        except OSError:
-            # Check if this is a virtual directory name
-            parts = path.lstrip('/\\').split('/')
-            if len(parts) == 1 and parts[0] in self.mounts:
-                 return dict(st_mode=(0o40777), st_nlink=2, st_size=4096, 
-                            st_ctime=time.time(), st_mtime=time.time(), st_atime=time.time())
+        attr = self.client.get_attr(path)
+        if not attr:
             raise OSError(errno.ENOENT, f"No such file: {path}")
+        return attr
 
     def readdir(self, path, fh):
-        real_path, is_root = self._resolve(path)
         entries = {'.', '..'}
-        
-        if is_root:
-            # ONLY return virtual directories at the hub root for professional look
-            entries.update(self.mounts.keys())
-        else:
-            try: entries.update(os.listdir(real_path))
-            except: pass
-            
+        entries.update(self.client.list_dir(path))
         return list(entries)
 
     def read(self, path, size, offset, fh):
-        real_path, _ = self._resolve(path)
-        try:
-            with open(real_path, 'rb') as f:
-                f.seek(offset)
-                return f.read(size)
-        except: return b''
+        return self.client.read(path, size, offset)
 
     def write(self, path, data, offset, fh):
-        real_path, _ = self._resolve(path)
-        try:
-            os.makedirs(os.path.dirname(real_path), exist_ok=True)
-            mode = 'r+b' if os.path.exists(real_path) else 'wb'
-            with open(real_path, mode) as f:
-                f.seek(offset)
-                f.write(data)
-            return len(data)
-        except Exception as e:
-            logging.error(f"Write Error at {path}: {e}")
+        written = self.client.write(path, data, offset)
+        if written == 0:
             raise OSError(errno.EACCES, "Write failed")
+        return written
 
     def create(self, path, mode, fi=None):
-        real_path, _ = self._resolve(path)
-        try:
-            os.makedirs(os.path.dirname(real_path), exist_ok=True)
-            open(real_path, 'wb').close()
-            st = os.stat(real_path)
-            # Necessary for some Windows apps to recognize the new file
-            return 0
-        except: raise OSError(errno.EACCES, "Create failed")
+        # Map to POST /pod/path
+        resp = self.client.request("POST", path)
+        if not resp:
+            raise OSError(errno.EACCES, "Create failed")
+        return 0
 
     def mkdir(self, path, mode):
-        real_path, _ = self._resolve(path)
-        try: 
-            os.makedirs(real_path, exist_ok=True)
-            return 0
-        except Exception as e:
-            raise OSError(errno.EACCES, f"Mkdir failed: {e}")
+        # Map to POST /pod/path with dir marker or separate endpoint
+        resp = self.client.request("POST", path, params={"type": "container"})
+        if not resp:
+            raise OSError(errno.EACCES, "Mkdir failed")
+        return 0
 
     def unlink(self, path):
-        real_path, _ = self._resolve(path)
-        try: os.remove(real_path)
-        except: pass
-        return 0
+        resp = self.client.request("DELETE", path)
+        return 0 if resp else -1
 
     def rmdir(self, path):
-        real_path, _ = self._resolve(path)
-        try: os.rmdir(real_path)
-        except: pass
-        return 0
+        resp = self.client.request("DELETE", path)
+        return 0 if resp else -1
 
-def main(mountpoint, raw_sources, verbose=False):
+def main(mountpoint, proxy_url="http://localhost:8089", verbose=False):
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
-    logging.info(f"Mounting Virtual Pod to {mountpoint}...")
+    logging.info(f"Mounting Virtual Pod to {mountpoint} via {proxy_url}...")
     try:
-        FUSE(ProxionUnifiedFS(raw_sources), mountpoint, nothreads=False, foreground=True)
+        FUSE(ProxionUnifiedFS(proxy_url), mountpoint, nothreads=False, foreground=True)
     except Exception as e:
         logging.critical(f"FUSE Mount failed: {e}")
 
@@ -170,10 +208,10 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Proxion Virtual Pod FUSE Driver")
     parser.add_argument("mountpoint", help="Mount point (e.g. P:)")
-    parser.add_argument("raw_sources", nargs='+', help="List of 'Name|Path' mappings")
+    parser.add_argument("--proxy", default="http://localhost:8089", help="Pod Proxy URL")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     print(f"--- FUSE Starting: {args.mountpoint} ---")
-    print(f"--- Sources: {args.raw_sources} ---")
-    main(args.mountpoint, args.raw_sources, args.verbose)
+    print(f"--- Proxy: {args.proxy} ---")
+    main(args.mountpoint, args.proxy, args.verbose)
