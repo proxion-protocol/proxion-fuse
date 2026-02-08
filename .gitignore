@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.mount_token
+fuse_audit.log
+fuse_debug.log
